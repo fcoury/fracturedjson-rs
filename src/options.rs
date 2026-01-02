@@ -30,9 +30,9 @@ pub enum TableCommaPlacement {
 pub struct FracturedJsonOptions {
     pub json_eol_style: EolStyle,
     pub max_total_line_length: usize,
-    pub max_inline_complexity: usize,
-    pub max_compact_array_complexity: usize,
-    pub max_table_row_complexity: usize,
+    pub max_inline_complexity: isize,
+    pub max_compact_array_complexity: isize,
+    pub max_table_row_complexity: isize,
     pub max_prop_name_padding: usize,
     pub colon_before_prop_name_padding: bool,
     pub table_comma_placement: TableCommaPlacement,

@@ -55,7 +55,7 @@ pub struct InputPosition {
     pub column: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonToken {
     pub token_type: TokenType,
     pub text: String,

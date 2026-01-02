@@ -113,17 +113,17 @@ impl Parser {
         match current.token_type {
             TokenType::BeginArray => self.parse_array(enumerator),
             TokenType::BeginObject => self.parse_object(enumerator),
-            _ => Ok(self.parse_simple(&current)),
+            _ => self.parse_simple(&current),
         }
     }
 
-    fn parse_simple(&self, token: &JsonToken) -> JsonItem {
+    fn parse_simple(&self, token: &JsonToken) -> Result<JsonItem, FracturedJsonError> {
         let mut item = JsonItem::default();
-        item.item_type = Self::item_type_from_token_type(token);
+        item.item_type = Self::item_type_from_token_type(token)?;
         item.value = token.text.clone();
         item.input_position = token.input_position;
         item.complexity = 0;
-        item
+        Ok(item)
     }
 
     fn parse_array<I>(&self, enumerator: &mut TokenEnumerator<I>) -> Result<JsonItem, FracturedJsonError>
@@ -194,7 +194,7 @@ impl Parser {
                 }
                 TokenType::BlankLine => {
                     if self.options.preserve_blank_lines {
-                        child_list.push(self.parse_simple(&token));
+                        child_list.push(self.parse_simple(&token)?);
                     }
                 }
                 TokenType::BlockComment => {
@@ -212,7 +212,7 @@ impl Parser {
                         child_list.push(unplaced_comment.take().unwrap());
                     }
 
-                    let comment_item = self.parse_simple(&token);
+                    let comment_item = self.parse_simple(&token)?;
                     if Self::is_multiline_comment(&comment_item) {
                         child_list.push(comment_item);
                         continue;
@@ -244,7 +244,7 @@ impl Parser {
 
                     if unplaced_comment.is_some() {
                         child_list.push(unplaced_comment.take().unwrap());
-                        child_list.push(self.parse_simple(&token));
+                        child_list.push(self.parse_simple(&token)?);
                         continue;
                     }
 
@@ -257,7 +257,7 @@ impl Parser {
                         continue;
                     }
 
-                    child_list.push(self.parse_simple(&token));
+                    child_list.push(self.parse_simple(&token)?);
                 }
                 TokenType::False
                 | TokenType::True
@@ -373,7 +373,7 @@ impl Parser {
                         continue;
                     }
                     child_list.extend(before_prop_comments.drain(..));
-                    child_list.push(self.parse_simple(&token));
+                    child_list.push(self.parse_simple(&token)?);
                 }
                 TokenType::BlockComment | TokenType::LineComment => {
                     if self.options.comment_policy == CommentPolicy::Remove {
@@ -386,11 +386,11 @@ impl Parser {
                         ));
                     }
                     if matches!(phase, ObjectPhase::BeforePropName) || property_name.is_none() {
-                        before_prop_comments.push(self.parse_simple(&token));
+                        before_prop_comments.push(self.parse_simple(&token)?);
                     } else if matches!(phase, ObjectPhase::AfterPropName | ObjectPhase::AfterColon) {
                         mid_prop_comments.push(token);
                     } else {
-                        after_prop_comment = Some(self.parse_simple(&token));
+                        after_prop_comment = Some(self.parse_simple(&token)?);
                         after_prop_comment_was_after_comma = matches!(phase, ObjectPhase::AfterComma);
                     }
                 }
@@ -473,17 +473,17 @@ impl Parser {
         Ok(obj_item)
     }
 
-    fn item_type_from_token_type(token: &JsonToken) -> JsonItemType {
+    fn item_type_from_token_type(token: &JsonToken) -> Result<JsonItemType, FracturedJsonError> {
         match token.token_type {
-            TokenType::False => JsonItemType::False,
-            TokenType::True => JsonItemType::True,
-            TokenType::Null => JsonItemType::Null,
-            TokenType::Number => JsonItemType::Number,
-            TokenType::String => JsonItemType::String,
-            TokenType::BlankLine => JsonItemType::BlankLine,
-            TokenType::BlockComment => JsonItemType::BlockComment,
-            TokenType::LineComment => JsonItemType::LineComment,
-            _ => panic!("Unexpected Token"),
+            TokenType::False => Ok(JsonItemType::False),
+            TokenType::True => Ok(JsonItemType::True),
+            TokenType::Null => Ok(JsonItemType::Null),
+            TokenType::Number => Ok(JsonItemType::Number),
+            TokenType::String => Ok(JsonItemType::String),
+            TokenType::BlankLine => Ok(JsonItemType::BlankLine),
+            TokenType::BlockComment => Ok(JsonItemType::BlockComment),
+            TokenType::LineComment => Ok(JsonItemType::LineComment),
+            _ => Err(FracturedJsonError::new("Unexpected Token", Some(token.input_position))),
         }
     }
 
@@ -576,4 +576,584 @@ enum ObjectPhase {
     AfterColon,
     AfterPropValue,
     AfterComma,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::{CommentPolicy, FracturedJsonOptions};
+    use crate::model::JsonItemType;
+
+    #[test]
+    fn test_simple_and_valid_array() {
+        let input = r#"[4.7, true, null, "a string", {}, false, []]"#;
+        let parser = Parser::new(FracturedJsonOptions::default());
+        let doc_model = parser.parse_top_level(input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].item_type, JsonItemType::Array);
+
+        let expected_child_types = vec![
+            JsonItemType::Number,
+            JsonItemType::True,
+            JsonItemType::Null,
+            JsonItemType::String,
+            JsonItemType::Object,
+            JsonItemType::False,
+            JsonItemType::Array,
+        ];
+        let found_child_types: Vec<JsonItemType> =
+            doc_model[0].children.iter().map(|ch| ch.item_type).collect();
+        assert_eq!(expected_child_types, found_child_types);
+
+        let expected_text = vec!["4.7", "true", "null", "\"a string\"", "", "false", ""];
+        let found_text: Vec<String> = doc_model[0].children.iter().map(|ch| ch.value.clone()).collect();
+        assert_eq!(expected_text, found_text);
+    }
+
+    #[test]
+    fn array_with_inline_block_comments() {
+        let input = "[ /*a*/ 1 /*b*/ ]";
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 1);
+        assert_eq!(doc_model[0].children[0].prefix_comment, "/*a*/");
+        assert_eq!(doc_model[0].children[0].postfix_comment, "/*b*/");
+    }
+
+    #[test]
+    fn array_with_mixed_inline_comments() {
+        let input = ["[ /*a*/ 1 //b", "]"].join("\r\n");
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 1);
+        assert_eq!(doc_model[0].children[0].prefix_comment, "/*a*/");
+        assert_eq!(doc_model[0].children[0].postfix_comment, "//b");
+    }
+
+    #[test]
+    fn array_with_unattached_trailing_comments() {
+        let input = ["[ /*a*/ 1 /*b*/ /*c*/", "]"].join("\r\n");
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 2);
+        assert_eq!(doc_model[0].children[0].item_type, JsonItemType::Number);
+        assert_eq!(doc_model[0].children[0].prefix_comment, "/*a*/");
+        assert_eq!(doc_model[0].children[0].postfix_comment, "/*b*/");
+        assert_eq!(doc_model[0].children[1].item_type, JsonItemType::BlockComment);
+        assert_eq!(doc_model[0].children[1].value, "/*c*/");
+    }
+
+    #[test]
+    fn array_with_multiple_leading_comments() {
+        let input = "[ /*a*/ /*b*/ 1 ]";
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 2);
+        assert_eq!(doc_model[0].children[0].item_type, JsonItemType::BlockComment);
+        assert_eq!(doc_model[0].children[0].value, "/*a*/");
+        assert_eq!(doc_model[0].children[1].item_type, JsonItemType::Number);
+        assert_eq!(doc_model[0].children[1].prefix_comment, "/*b*/");
+    }
+
+    #[test]
+    fn array_ambiguous_comment_precedes_comma() {
+        let input = "[ /*a*/ 1 /*b*/, 2 /*c*/ ]";
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 2);
+        assert_eq!(doc_model[0].children[0].prefix_comment, "/*a*/");
+        assert_eq!(doc_model[0].children[0].postfix_comment, "/*b*/");
+        assert_eq!(doc_model[0].children[1].prefix_comment_length, 0);
+        assert_eq!(doc_model[0].children[1].postfix_comment, "/*c*/");
+    }
+
+    #[test]
+    fn array_ambiguous_comment_follows_comma() {
+        let input = "[ /*a*/ 1, /*b*/ 2 /*c*/ ]";
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 2);
+        assert_eq!(doc_model[0].children[0].prefix_comment, "/*a*/");
+        assert_eq!(doc_model[0].children[0].postfix_comment_length, 0);
+        assert_eq!(doc_model[0].children[1].prefix_comment, "/*b*/");
+        assert_eq!(doc_model[0].children[1].postfix_comment, "/*c*/");
+    }
+
+    #[test]
+    fn array_ambiguous_comment_follows_comma_with_newline() {
+        let input = ["[ /*a*/ 1, /*b*/", "2 /*c*/ ]"].join("\r\n");
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 2);
+        assert_eq!(doc_model[0].children[0].prefix_comment, "/*a*/");
+        assert_eq!(doc_model[0].children[0].postfix_comment, "/*b*/");
+        assert_eq!(doc_model[0].children[1].prefix_comment_length, 0);
+        assert_eq!(doc_model[0].children[1].postfix_comment, "/*c*/");
+    }
+
+    #[test]
+    fn array_multiple_unattached_comments() {
+        let input = ["[", "    /*a*/ //b", "    null", "]"].join("\r\n");
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 3);
+        assert_eq!(doc_model[0].children[0].value, "/*a*/");
+        assert_eq!(doc_model[0].children[1].value, "//b");
+        assert_eq!(doc_model[0].children[2].item_type, JsonItemType::Null);
+    }
+
+    #[test]
+    fn array_multiple_comment_stands_alone() {
+        let input = ["[", "    1, /*a", "    b*/ 2", "]"].join("\r\n");
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 3);
+        assert_eq!(doc_model[0].children[0].value, "1");
+        assert_eq!(doc_model[0].children[1].value, "/*a\r\n    b*/");
+        assert_eq!(doc_model[0].children[2].value, "2");
+    }
+
+    #[test]
+    fn array_blank_lines_are_preserved_or_removed() {
+        let input = ["[", "", "    //comment", "    true,", "", "    ", "    false", "]"].join("\r\n");
+
+        let mut preserve_options = FracturedJsonOptions::default();
+        preserve_options.comment_policy = CommentPolicy::Preserve;
+        preserve_options.allow_trailing_commas = true;
+        preserve_options.preserve_blank_lines = true;
+
+        let preserve_parser = Parser::new(preserve_options);
+        let preserve_doc_model = preserve_parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(preserve_doc_model.len(), 1);
+        assert_eq!(preserve_doc_model[0].item_type, JsonItemType::Array);
+        let preserve_expected_types = vec![
+            JsonItemType::BlankLine,
+            JsonItemType::LineComment,
+            JsonItemType::True,
+            JsonItemType::BlankLine,
+            JsonItemType::BlankLine,
+            JsonItemType::False,
+        ];
+        let preserve_found_types: Vec<JsonItemType> =
+            preserve_doc_model[0].children.iter().map(|ch| ch.item_type).collect();
+        assert_eq!(preserve_expected_types, preserve_found_types);
+
+        let mut remove_options = FracturedJsonOptions::default();
+        remove_options.comment_policy = CommentPolicy::Remove;
+        remove_options.allow_trailing_commas = true;
+        remove_options.preserve_blank_lines = false;
+
+        let remove_parser = Parser::new(remove_options);
+        let remove_doc_model = remove_parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(remove_doc_model.len(), 1);
+        assert_eq!(remove_doc_model[0].item_type, JsonItemType::Array);
+        let remove_expected_types = vec![JsonItemType::True, JsonItemType::False];
+        let remove_found_types: Vec<JsonItemType> =
+            remove_doc_model[0].children.iter().map(|ch| ch.item_type).collect();
+        assert_eq!(remove_expected_types, remove_found_types);
+    }
+
+    #[test]
+    fn test_simple_and_valid_object() {
+        let input = "{ \"a\": 5.2, \"b\": false, \"c\": null, \"d\": true, \"e\":[], \"f\":{}, \"g\": \"a string\" }";
+        let parser = Parser::new(FracturedJsonOptions::default());
+        let doc_model = parser.parse_top_level(input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].item_type, JsonItemType::Object);
+
+        let expected_child_types = vec![
+            JsonItemType::Number,
+            JsonItemType::False,
+            JsonItemType::Null,
+            JsonItemType::True,
+            JsonItemType::Array,
+            JsonItemType::Object,
+            JsonItemType::String,
+        ];
+        let found_child_types: Vec<JsonItemType> =
+            doc_model[0].children.iter().map(|ch| ch.item_type).collect();
+        assert_eq!(expected_child_types, found_child_types);
+
+        let expected_prop_names = vec![
+            "\"a\"", "\"b\"", "\"c\"", "\"d\"", "\"e\"", "\"f\"", "\"g\"",
+        ];
+        let found_prop_names: Vec<String> = doc_model[0].children.iter().map(|ch| ch.name.clone()).collect();
+        assert_eq!(expected_prop_names, found_prop_names);
+
+        let expected_text = vec!["5.2", "false", "null", "true", "", "", "\"a string\""];        
+        let found_text: Vec<String> = doc_model[0].children.iter().map(|ch| ch.value.clone()).collect();
+        assert_eq!(expected_text, found_text);
+    }
+
+    #[test]
+    fn object_blank_lines_are_preserved_or_removed() {
+        let input = ["{", "", "    //comment", "    \"w\": true,", "", "    ", "    \"x\": false", "}"].join("\r\n");
+
+        let mut preserve_options = FracturedJsonOptions::default();
+        preserve_options.comment_policy = CommentPolicy::Preserve;
+        preserve_options.allow_trailing_commas = true;
+        preserve_options.preserve_blank_lines = true;
+
+        let preserve_parser = Parser::new(preserve_options);
+        let preserve_doc_model = preserve_parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(preserve_doc_model.len(), 1);
+        assert_eq!(preserve_doc_model[0].item_type, JsonItemType::Object);
+        let preserve_expected_types = vec![
+            JsonItemType::BlankLine,
+            JsonItemType::LineComment,
+            JsonItemType::True,
+            JsonItemType::BlankLine,
+            JsonItemType::BlankLine,
+            JsonItemType::False,
+        ];
+        let preserve_found_types: Vec<JsonItemType> =
+            preserve_doc_model[0].children.iter().map(|ch| ch.item_type).collect();
+        assert_eq!(preserve_expected_types, preserve_found_types);
+
+        let mut remove_options = FracturedJsonOptions::default();
+        remove_options.comment_policy = CommentPolicy::Remove;
+        remove_options.allow_trailing_commas = true;
+        remove_options.preserve_blank_lines = false;
+
+        let remove_parser = Parser::new(remove_options);
+        let remove_doc_model = remove_parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(remove_doc_model.len(), 1);
+        assert_eq!(remove_doc_model[0].item_type, JsonItemType::Object);
+        let remove_expected_types = vec![JsonItemType::True, JsonItemType::False];
+        let remove_found_types: Vec<JsonItemType> =
+            remove_doc_model[0].children.iter().map(|ch| ch.item_type).collect();
+        assert_eq!(remove_expected_types, remove_found_types);
+    }
+
+    #[test]
+    fn object_with_inline_block_comments() {
+        let input = "{ /*a*/ \"w\": /*b*/ 1 /*c*/ }";
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 1);
+        assert_eq!(doc_model[0].children[0].prefix_comment, "/*a*/");
+        assert_eq!(doc_model[0].children[0].middle_comment, "/*b*/");
+        assert_eq!(doc_model[0].children[0].postfix_comment, "/*c*/");
+    }
+
+    #[test]
+    fn object_middle_comments_combined_1() {
+        let input = ["{", "    \"w\" /*a*/ : //b", "        10.9,", "}"].join("\r\n");
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 1);
+        assert_eq!(doc_model[0].children[0].prefix_comment_length, 0);
+        assert_eq!(doc_model[0].children[0].middle_comment, "/*a*/\n//b\n");
+        assert_eq!(doc_model[0].children[0].postfix_comment_length, 0);
+    }
+
+    #[test]
+    fn object_middle_comments_combined_2() {
+        let input = ["{", "    \"w\" /*a*/ :", "    /*b*/ 10.9,", "}"].join("\r\n");
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 1);
+        assert_eq!(doc_model[0].children[0].prefix_comment_length, 0);
+        assert_eq!(doc_model[0].children[0].middle_comment, "/*a*/\n/*b*/");
+        assert_eq!(doc_model[0].children[0].postfix_comment_length, 0);
+    }
+
+    #[test]
+    fn object_middle_comments_combined_3() {
+        let input = ["{", "    \"w\": //a", "    /*b*/ 10.9,", "}"].join("\r\n");
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 1);
+        assert_eq!(doc_model[0].children[0].prefix_comment_length, 0);
+        assert_eq!(doc_model[0].children[0].middle_comment, "//a\n/*b*/");
+        assert_eq!(doc_model[0].children[0].postfix_comment_length, 0);
+    }
+
+    #[test]
+    fn object_comments_prefer_same_line_elements() {
+        let input = [
+            "{",
+            "          \"w\": 1, /*a*/",
+            "    /*b*/ \"x\": 2, /*c*/",
+            "          \"y\": 3,  /*d*/",
+            "          \"z\": 4",
+            "}",
+        ]
+        .join("\r\n");
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 4);
+        assert_eq!(doc_model[0].children[0].prefix_comment_length, 0);
+        assert_eq!(doc_model[0].children[0].postfix_comment, "/*a*/");
+        assert_eq!(doc_model[0].children[1].prefix_comment, "/*b*/");
+        assert_eq!(doc_model[0].children[1].postfix_comment, "/*c*/");
+        assert_eq!(doc_model[0].children[2].prefix_comment_length, 0);
+        assert_eq!(doc_model[0].children[2].postfix_comment, "/*d*/");
+    }
+
+    #[test]
+    fn object_with_inline_block_comments_2() {
+        let input = "{  \"w\": 1, /*a*/ \"x\": 2 }";
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 2);
+        assert_eq!(doc_model[0].children[1].prefix_comment, "/*a*/");
+    }
+
+    #[test]
+    fn object_with_inline_block_comments_3() {
+        let input = "{  \"w\": 1, /*a*/ /*b*/ \"x\": 2 }";
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 2);
+
+        assert_eq!(doc_model[0].children[0].name, "\"w\"");
+        assert_eq!(doc_model[0].children[0].item_type, JsonItemType::Number);
+        assert_eq!(doc_model[0].children[0].postfix_comment, "/*a*/");
+
+        assert_eq!(doc_model[0].children[1].name, "\"x\"");
+        assert_eq!(doc_model[0].children[1].item_type, JsonItemType::Number);
+        assert_eq!(doc_model[0].children[1].prefix_comment, "/*b*/");
+    }
+
+    #[test]
+    fn array_comments_for_multiline_element() {
+        let input = ["[", "    /*a*/ [", "        1, 2, 3", "    ] //b", "]"].join("\r\n");
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 1);
+        assert_eq!(doc_model[0].children[0].prefix_comment, "/*a*/");
+        assert_eq!(doc_model[0].children[0].postfix_comment, "//b");
+    }
+
+    #[test]
+    fn object_comments_for_multiline_element() {
+        let input = ["{", "    /*a*/ \"w\": [", "        1, 2, 3", "    ] //b", "}"].join("\r\n");
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].children.len(), 1);
+        assert_eq!(doc_model[0].children[0].prefix_comment, "/*a*/");
+        assert_eq!(doc_model[0].children[0].postfix_comment, "//b");
+    }
+
+    #[test]
+    fn complexity_work() {
+        let input = [
+            "[",
+            "    null,",
+            "    [ 1, 2, 3 ],",
+            "    [ 1, 2, {}],",
+            "    [ 1, 2, { /*a*/ }],",
+            "    [ 1, 2, { \"w\": 1 }]",
+            "]",
+        ]
+        .join("\r\n");
+
+        let mut options = FracturedJsonOptions::default();
+        options.comment_policy = CommentPolicy::Preserve;
+        options.allow_trailing_commas = true;
+        options.preserve_blank_lines = true;
+
+        let parser = Parser::new(options);
+        let doc_model = parser.parse_top_level(&input, false).unwrap();
+
+        assert_eq!(doc_model.len(), 1);
+        assert_eq!(doc_model[0].complexity, 3);
+        assert_eq!(doc_model[0].children.len(), 5);
+
+        assert_eq!(doc_model[0].children[0].complexity, 0);
+        assert_eq!(doc_model[0].children[1].complexity, 1);
+        assert_eq!(doc_model[0].children[2].complexity, 1);
+        assert_eq!(doc_model[0].children[2].children[2].complexity, 0);
+        assert_eq!(doc_model[0].children[3].complexity, 1);
+        assert_eq!(doc_model[0].children[3].children[2].complexity, 0);
+        assert_eq!(doc_model[0].children[4].complexity, 2);
+        assert_eq!(doc_model[0].children[4].children[2].complexity, 1);
+    }
+
+    #[test]
+    fn throws_for_malformed_data() {
+        let cases = vec![
+            "[,1]",
+            "[1 2]",
+            "[1, 2,]",
+            "[1, 2}",
+            "[1, 2",
+            "[1, /*a*/ 2]",
+            "[1, //a\n 2]",
+            "{, \"w\":1 }",
+            "{ \"w\":1 ",
+            "{ /*a*/ \"w\":1 }",
+            "{ \"w\":1, }",
+            "{ \"w\":1 ]",
+            "{ \"w\"::1 ",
+            "{ \"w\" \"foo\" }",
+            "{ \"w\" {:1 }",
+            "{ \"w\":1 \"x\":2 }",
+            "{ \"a\": 1, \"b\" }\n",
+            "{ \"a\": 1, \"b:\" }\n",
+        ];
+
+        let parser = Parser::new(FracturedJsonOptions::default());
+        for input in cases {
+            assert!(parser.parse_top_level(input, false).is_err(), "input={}", input);
+        }
+    }
+
+    #[test]
+    fn stops_after_first_element() {
+        let input = "[ 1, 2 ],[ 3, 4 ]";
+        let parser = Parser::new(FracturedJsonOptions::default());
+        assert!(parser.parse_top_level(input, true).is_err());
+    }
 }

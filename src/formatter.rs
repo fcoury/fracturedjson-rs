@@ -187,8 +187,9 @@ impl Formatter {
             }
         }
 
-        let recursive_template = item.complexity <= self.options.max_compact_array_complexity
-            || item.complexity <= self.options.max_table_row_complexity + 1;
+        let item_complexity = item.complexity as isize;
+        let recursive_template = item_complexity <= self.options.max_compact_array_complexity
+            || item_complexity <= self.options.max_table_row_complexity + 1;
         let mut template = TableTemplate::new(self.pads.clone(), self.options.number_list_alignment);
         template.measure_table_root(item, recursive_template);
 
@@ -260,7 +261,9 @@ impl Formatter {
             }
             + if include_trailing_comma { self.pads.comma_len() } else { 0 };
 
-        if item.complexity > self.options.max_inline_complexity || length_to_consider > self.available_line_space(depth) {
+        if (item.complexity as isize) > self.options.max_inline_complexity
+            || length_to_consider > self.available_line_space(depth)
+        {
             return false;
         }
 
@@ -285,7 +288,7 @@ impl Formatter {
         if item.children.is_empty() || item.children.len() < self.options.min_compact_array_row_items {
             return false;
         }
-        if item.complexity > self.options.max_compact_array_complexity {
+        if (item.complexity as isize) > self.options.max_compact_array_complexity {
             return false;
         }
         if item.requires_multiple_lines {
@@ -351,7 +354,7 @@ impl Formatter {
         template: &mut TableTemplate,
         parent_template: Option<&TableTemplate>,
     ) -> bool {
-        if item.complexity > self.options.max_table_row_complexity + 1 {
+        if (item.complexity as isize) > self.options.max_table_row_complexity + 1 {
             return false;
         }
         if template.requires_multiple_lines {

@@ -122,11 +122,16 @@ impl Iterator for TokenGenerator {
                     self.state.advance(true);
                 }
                 '\n' => {
-                    if !self.state.non_whitespace_since_last_newline {
-                        return Some(Ok(self.state.make_token(TokenType::BlankLine, "\n")));
-                    }
+                    let token = if !self.state.non_whitespace_since_last_newline {
+                        Some(self.state.make_token(TokenType::BlankLine, "\n"))
+                    } else {
+                        None
+                    };
                     self.state.new_line();
                     self.state.set_token_start();
+                    if let Some(token) = token {
+                        return Some(Ok(token));
+                    }
                 }
                 '{' => return Some(process_single_char(&mut self.state, "{", TokenType::BeginObject)),
                 '}' => return Some(process_single_char(&mut self.state, "}", TokenType::EndObject)),
@@ -175,6 +180,9 @@ fn process_keyword(
             return Err(state.error("Unexpected end of input while processing keyword"));
         }
         state.advance(false);
+        if state.at_end() {
+            return Err(state.error("Unexpected end of input while processing keyword"));
+        }
         let current = state.current().unwrap();
         if current != expected {
             return Err(state.error("Unexpected keyword"));
@@ -280,6 +288,16 @@ fn process_number(state: &mut ScannerState) -> Result<JsonToken, FracturedJsonEr
     state.set_token_start();
     let mut phase = NumberPhase::Beginning;
     loop {
+        if state.at_end() {
+            return match phase {
+                NumberPhase::PastFirstDigitOfWhole
+                | NumberPhase::PastWhole
+                | NumberPhase::PastFirstDigitOfFractional
+                | NumberPhase::PastFirstDigitOfExponent => Ok(state.make_token_from_buffer(TokenType::Number, false)),
+                _ => Err(state.error("Unexpected end of input while processing number")),
+            };
+        }
+
         let ch = state.current().unwrap();
         let mut handling = CharHandling::ValidAndConsumed;
 
@@ -367,18 +385,7 @@ fn process_number(state: &mut ScannerState) -> Result<JsonToken, FracturedJsonEr
             return Ok(state.make_token_from_buffer(TokenType::Number, false));
         }
 
-        if !state.at_end() {
-            state.advance(false);
-            continue;
-        }
-
-        return match phase {
-            NumberPhase::PastFirstDigitOfWhole
-            | NumberPhase::PastWhole
-            | NumberPhase::PastFirstDigitOfFractional
-            | NumberPhase::PastFirstDigitOfExponent => Ok(state.make_token_from_buffer(TokenType::Number, false)),
-            _ => Err(state.error("Unexpected end of input while processing number")),
-        };
+        state.advance(false);
     }
 }
 
@@ -417,4 +424,176 @@ enum CharHandling {
     InvalidatesToken,
     ValidAndConsumed,
     StartOfNewToken,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{InputPosition, JsonToken, TokenType};
+
+    #[test]
+    fn echoes_tokens() {
+        let cases: Vec<(&str, TokenType)> = vec![
+            ("{", TokenType::BeginObject),
+            ("}", TokenType::EndObject),
+            ("[", TokenType::BeginArray),
+            ("]", TokenType::EndArray),
+            (":", TokenType::Colon),
+            (",", TokenType::Comma),
+            ("true", TokenType::True),
+            ("false", TokenType::False),
+            ("null", TokenType::Null),
+            ("\"simple\"", TokenType::String),
+            ("\"with \\t escapes\\u80fE\\r\\n\"", TokenType::String),
+            ("\"\"", TokenType::String),
+            ("3", TokenType::Number),
+            ("3.0", TokenType::Number),
+            ("-3", TokenType::Number),
+            ("-3.0", TokenType::Number),
+            ("0", TokenType::Number),
+            ("-0", TokenType::Number),
+            ("0.0", TokenType::Number),
+            ("9000", TokenType::Number),
+            ("3e2", TokenType::Number),
+            ("3.01e+2", TokenType::Number),
+            ("3e-2", TokenType::Number),
+            ("-3.01E-2", TokenType::Number),
+            ("\n", TokenType::BlankLine),
+            ("//\n", TokenType::LineComment),
+            ("// comment\n", TokenType::LineComment),
+            ("// comment", TokenType::LineComment),
+            ("/**/", TokenType::BlockComment),
+            ("/* comment */", TokenType::BlockComment),
+            ("/* comment\n *with* newline */", TokenType::BlockComment),
+        ];
+
+        for (input, token_type) in cases {
+            let possibly_trimmed = if token_type == TokenType::LineComment {
+                input.trim_end().to_string()
+            } else {
+                input.to_string()
+            };
+
+            let results: Vec<JsonToken> = match TokenGenerator::new(input).collect::<Result<Vec<_>, _>>() {
+                Ok(tokens) => tokens,
+                Err(err) => panic!("input={} err={}", input, err),
+            };
+            assert_eq!(results.len(), 1, "input={}", input);
+            assert_eq!(results[0].text, possibly_trimmed);
+            assert_eq!(results[0].token_type, token_type);
+        }
+    }
+
+    #[test]
+    fn correct_position_for_second_token() {
+        let cases: Vec<(&str, usize, usize, usize)> = vec![
+            ("{,", 1, 0, 1),
+            ("null,", 4, 0, 4),
+            ("3,", 1, 0, 1),
+            ("3.12,", 4, 0, 4),
+            ("3e2,", 3, 0, 3),
+            ("\"st\",", 4, 0, 4),
+            ("null ,", 5, 0, 5),
+            ("null\t,", 5, 0, 5),
+            ("null\n,", 5, 1, 0),
+            (" null \r\n ,", 9, 1, 1),
+            ("//co\n,", 5, 1, 0),
+            ("/**/,", 4, 0, 4),
+            ("/*1*/,", 5, 0, 5),
+            ("/*1\n*/,", 6, 1, 2),
+            ("\n\n", 1, 1, 0),
+        ];
+
+        for (input, index, row, column) in cases {
+            let results: Vec<JsonToken> = match TokenGenerator::new(input).collect::<Result<Vec<_>, _>>() {
+                Ok(tokens) => tokens,
+                Err(err) => panic!("input={} err={}", input, err),
+            };
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[1].input_position.index, index);
+            assert_eq!(results[1].input_position.row, row);
+            assert_eq!(results[1].input_position.column, column);
+
+            let expected_text = if results[0].token_type == TokenType::BlankLine {
+                input[..index].to_string()
+            } else {
+                input[..index].trim().to_string()
+            };
+            assert_eq!(results[0].text, expected_text);
+        }
+    }
+
+    #[test]
+    fn throw_if_unexpected_end() {
+        let cases = vec![
+            "t",
+            "nul",
+            "/",
+            "/*",
+            "/* comment *",
+            "\"",
+            "\"string",
+            "\"string with escaped quote\\\"",
+            "1.",
+            "-",
+            "1.0e",
+            "1.0e+",
+        ];
+
+        for input in cases {
+            let result: Result<Vec<JsonToken>, FracturedJsonError> = TokenGenerator::new(input).collect();
+            assert!(result.is_err(), "input={}", input);
+            let err = result.err().unwrap();
+            let pos = err.input_position.unwrap();
+            assert_eq!(pos.index, input.chars().count());
+        }
+    }
+
+    #[test]
+    fn token_sequences_match_sample() {
+        let input_rows = vec![
+            "{                           ",
+            "    // A line comment       ",
+            "    \"item1\": \"a string\",    ",
+            "                            ",
+            "    /* a block              ",
+            "       comment */           ",
+            "    \"item2\": [null, -2.0]   ",
+            "}                           ",
+        ];
+        let input_string = input_rows.join("\r\n");
+        let block_comment_text = format!("{}\r\n{}", input_rows[4].trim_start(), input_rows[5].trim_end());
+
+        let expected_tokens = vec![
+            JsonToken { token_type: TokenType::BeginObject, text: "{".to_string(), input_position: InputPosition { index: 0, row: 0, column: 0 } },
+            JsonToken { token_type: TokenType::LineComment, text: "// A line comment".to_string(), input_position: InputPosition { index: 34, row: 1, column: 4 } },
+            JsonToken { token_type: TokenType::String, text: "\"item1\"".to_string(), input_position: InputPosition { index: 64, row: 2, column: 4 } },
+            JsonToken { token_type: TokenType::Colon, text: ":".to_string(), input_position: InputPosition { index: 71, row: 2, column: 11 } },
+            JsonToken { token_type: TokenType::String, text: "\"a string\"".to_string(), input_position: InputPosition { index: 73, row: 2, column: 13 } },
+            JsonToken { token_type: TokenType::Comma, text: ",".to_string(), input_position: InputPosition { index: 83, row: 2, column: 23 } },
+            JsonToken { token_type: TokenType::BlankLine, text: "\n".to_string(), input_position: InputPosition { index: 90, row: 3, column: 0 } },
+            JsonToken { token_type: TokenType::BlockComment, text: block_comment_text, input_position: InputPosition { index: 124, row: 4, column: 4 } },
+            JsonToken { token_type: TokenType::String, text: "\"item2\"".to_string(), input_position: InputPosition { index: 184, row: 6, column: 4 } },
+            JsonToken { token_type: TokenType::Colon, text: ":".to_string(), input_position: InputPosition { index: 191, row: 6, column: 11 } },
+            JsonToken { token_type: TokenType::BeginArray, text: "[".to_string(), input_position: InputPosition { index: 193, row: 6, column: 13 } },
+            JsonToken { token_type: TokenType::Null, text: "null".to_string(), input_position: InputPosition { index: 194, row: 6, column: 14 } },
+            JsonToken { token_type: TokenType::Comma, text: ",".to_string(), input_position: InputPosition { index: 198, row: 6, column: 18 } },
+            JsonToken { token_type: TokenType::Number, text: "-2.0".to_string(), input_position: InputPosition { index: 200, row: 6, column: 20 } },
+            JsonToken { token_type: TokenType::EndArray, text: "]".to_string(), input_position: InputPosition { index: 204, row: 6, column: 24 } },
+            JsonToken { token_type: TokenType::EndObject, text: "}".to_string(), input_position: InputPosition { index: 210, row: 7, column: 0 } },
+        ];
+
+        let results: Vec<JsonToken> = match TokenGenerator::new(&input_string).collect::<Result<Vec<_>, _>>() {
+            Ok(tokens) => tokens,
+            Err(err) => panic!("err={}", err),
+        };
+
+        assert_eq!(results, expected_tokens);
+    }
+
+    #[test]
+    fn empty_input_is_handled() {
+        let results: Vec<JsonToken> = TokenGenerator::new("").collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(results.len(), 0);
+    }
 }

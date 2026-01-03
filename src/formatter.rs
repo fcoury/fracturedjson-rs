@@ -171,6 +171,114 @@ impl Formatter {
         Ok(self.buffer.as_string())
     }
 
+    /// Reformats JSONL (JSON Lines) input where each line is a separate JSON value.
+    ///
+    /// Each line is independently parsed and formatted. Empty lines are preserved.
+    /// The output maintains the line structure: one formatted JSON per line.
+    ///
+    /// # Arguments
+    ///
+    /// * `jsonl_text` - The JSONL string to format (one JSON value per line)
+    ///
+    /// # Returns
+    ///
+    /// The formatted JSONL string, or an error if any line fails to parse.
+    /// The error will indicate which line failed.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fracturedjson::Formatter;
+    ///
+    /// let input = r#"{"a":1}
+    /// {"b":2}
+    /// {"c":3}"#;
+    ///
+    /// let mut formatter = Formatter::new();
+    /// let output = formatter.reformat_jsonl(input).unwrap();
+    ///
+    /// // Each line is formatted independently
+    /// assert!(output.contains("\"a\": 1"));
+    /// ```
+    pub fn reformat_jsonl(&mut self, jsonl_text: &str) -> Result<String, FracturedJsonError> {
+        let mut output_lines = Vec::new();
+
+        for (line_num, line) in jsonl_text.lines().enumerate() {
+            // Preserve empty lines
+            if line.trim().is_empty() {
+                output_lines.push(String::new());
+                continue;
+            }
+
+            // Format the line
+            let formatted = self.reformat(line, 0).map_err(|e| {
+                FracturedJsonError::simple(format!("line {}: {}", line_num + 1, e))
+            })?;
+
+            // Remove trailing newline since we add our own
+            output_lines.push(formatted.trim_end().to_string());
+        }
+
+        // Join with newlines and add trailing newline
+        let mut result = output_lines.join("\n");
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        Ok(result)
+    }
+
+    /// Minifies JSONL (JSON Lines) input where each line is a separate JSON value.
+    ///
+    /// Each line is independently parsed and minified. Empty lines are preserved.
+    ///
+    /// # Arguments
+    ///
+    /// * `jsonl_text` - The JSONL string to minify (one JSON value per line)
+    ///
+    /// # Returns
+    ///
+    /// The minified JSONL string, or an error if any line fails to parse.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fracturedjson::Formatter;
+    ///
+    /// let input = r#"{ "a": 1 }
+    /// { "b": 2 }"#;
+    ///
+    /// let mut formatter = Formatter::new();
+    /// let output = formatter.minify_jsonl(input).unwrap();
+    ///
+    /// assert!(output.contains(r#"{"a":1}"#));
+    /// ```
+    pub fn minify_jsonl(&mut self, jsonl_text: &str) -> Result<String, FracturedJsonError> {
+        let mut output_lines = Vec::new();
+
+        for (line_num, line) in jsonl_text.lines().enumerate() {
+            // Preserve empty lines
+            if line.trim().is_empty() {
+                output_lines.push(String::new());
+                continue;
+            }
+
+            // Minify the line
+            let minified = self.minify(line).map_err(|e| {
+                FracturedJsonError::simple(format!("line {}: {}", line_num + 1, e))
+            })?;
+
+            // Remove trailing newline since we add our own
+            output_lines.push(minified.trim_end().to_string());
+        }
+
+        // Join with newlines and add trailing newline
+        let mut result = output_lines.join("\n");
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        Ok(result)
+    }
+
     /// Formats a [`serde_json::Value`] according to the current options.
     ///
     /// This is useful when you already have parsed JSON data and want to

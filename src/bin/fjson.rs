@@ -76,6 +76,14 @@ struct Args {
     /// Disable padding inside brackets for nested arrays/objects.
     #[arg(long)]
     no_nested_bracket_padding: bool,
+
+    /// Treat input as JSON Lines (one JSON value per line).
+    #[arg(long)]
+    jsonl: bool,
+
+    /// How to handle JSONL parsing errors (only used with --jsonl).
+    #[arg(long, value_enum, default_value = "fail")]
+    jsonl_errors: JsonlErrorPolicy,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -97,6 +105,18 @@ enum NumberAlignArg {
     Right,
     Decimal,
     Normalize,
+}
+
+/// How to handle errors when parsing JSONL input.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum JsonlErrorPolicy {
+    /// Stop processing on the first error (default).
+    #[default]
+    Fail,
+    /// Skip invalid lines and continue processing.
+    Skip,
+    /// Output invalid lines unchanged.
+    Passthrough,
 }
 
 fn main() {
@@ -129,7 +149,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     configure_options(&mut formatter.options, &args);
 
     // Format
-    let output = if args.compact {
+    let output = if args.jsonl {
+        process_jsonl(&input, &mut formatter, args.compact, args.jsonl_errors)?
+    } else if args.compact {
         formatter.minify(&input)?
     } else {
         formatter.reformat(&input, 0)?
@@ -144,6 +166,59 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Process JSONL input (one JSON value per line).
+fn process_jsonl(
+    input: &str,
+    formatter: &mut Formatter,
+    compact: bool,
+    error_policy: JsonlErrorPolicy,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut output_lines = Vec::new();
+
+    for (line_num, line) in input.lines().enumerate() {
+        // Preserve empty lines
+        if line.trim().is_empty() {
+            output_lines.push(String::new());
+            continue;
+        }
+
+        // Try to format the line
+        let result = if compact {
+            formatter.minify(line)
+        } else {
+            formatter.reformat(line, 0)
+        };
+
+        match result {
+            Ok(formatted) => {
+                // Remove trailing newline from formatted output since we add our own
+                let formatted = formatted.trim_end().to_string();
+                output_lines.push(formatted);
+            }
+            Err(e) => match error_policy {
+                JsonlErrorPolicy::Fail => {
+                    return Err(format!("line {}: {}", line_num + 1, e).into());
+                }
+                JsonlErrorPolicy::Skip => {
+                    // Skip this line entirely
+                    continue;
+                }
+                JsonlErrorPolicy::Passthrough => {
+                    // Output the original line unchanged
+                    output_lines.push(line.to_string());
+                }
+            },
+        }
+    }
+
+    // Join with newlines and add trailing newline
+    let mut result = output_lines.join("\n");
+    if !result.is_empty() {
+        result.push('\n');
+    }
+    Ok(result)
 }
 
 fn configure_options(opts: &mut FracturedJsonOptions, args: &Args) {

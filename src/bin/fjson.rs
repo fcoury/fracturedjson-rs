@@ -67,11 +67,11 @@ struct Args {
     number_align: NumberAlignArg,
 
     /// Maximum nesting depth for inline formatting (-1 to disable).
-    #[arg(long, default_value = "2")]
+    #[arg(long, default_value = "2", allow_negative_numbers = true)]
     max_inline_complexity: isize,
 
     /// Maximum nesting depth for table formatting (-1 to disable).
-    #[arg(long, default_value = "2")]
+    #[arg(long, default_value = "2", allow_negative_numbers = true)]
     max_table_complexity: isize,
 
     /// Add padding inside brackets for simple arrays/objects.
